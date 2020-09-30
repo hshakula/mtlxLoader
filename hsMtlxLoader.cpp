@@ -235,6 +235,8 @@ struct Mtlx2Rpr {
         addArithmeticNode("subtract", RPR_MATERIAL_NODE_OP_SUB, 2);
         addArithmeticNode("multiply", RPR_MATERIAL_NODE_OP_MUL, 2);
         addArithmeticNode("divide", RPR_MATERIAL_NODE_OP_DIV, 2);
+        addArithmeticNode("min", RPR_MATERIAL_NODE_OP_MIN, 2);
+        addArithmeticNode("max", RPR_MATERIAL_NODE_OP_MAX, 2);
         addArithmeticNode("dotproduct", RPR_MATERIAL_NODE_OP_DOT3, 2);
         addArithmeticNode("modulo", RPR_MATERIAL_NODE_OP_MOD, 2);
 
@@ -275,6 +277,8 @@ Mtlx2Rpr const& GetMtlx2Rpr() {
 // Loader context declarations
 //------------------------------------------------------------------------------
 
+struct Node;
+
 struct LoaderContext {
     mx::Node* nodeRef;
     mx::ShaderRef* shaderRef;
@@ -283,7 +287,10 @@ struct LoaderContext {
 
     std::vector<HsMtlxLoader::Result::ImageNode> imageNodes;
 
-    int logDepth = -1;
+    std::map<std::string, std::unique_ptr<Node>> globalNodes;
+    Node* GetGlobalNode(mx::Element* element);
+
+    int logDepth = 0;
     bool logEnabled = true;
 
     void LogLine(const char* fmt, ...) {
@@ -299,13 +306,22 @@ struct LoaderContext {
         }
     }
 
-    struct LogScope {
+    struct NestedLogScope {
         LoaderContext* ctx;
 
-        LogScope(LoaderContext* ctx) : ctx(ctx) { ctx->logDepth++; }
-        ~LogScope() { ctx->logDepth--; }
+        NestedLogScope(LoaderContext* ctx) : ctx(ctx) { ctx->logDepth++; }
+        ~NestedLogScope() { ctx->logDepth--; }
     };
-    LogScope GetLogScope() { return LogScope(this); };
+    NestedLogScope EnterNestedLogScope() { return NestedLogScope(this); };
+
+    struct GlobalLogScope {
+        LoaderContext* ctx;
+        int prevDepth;
+
+        GlobalLogScope(LoaderContext* ctx) : ctx(ctx), prevDepth(ctx->logDepth) { ctx->logDepth = 0; }
+        ~GlobalLogScope() { ctx->logDepth = prevDepth; }
+    };
+    GlobalLogScope EnterGlobalLogScope() { return GlobalLogScope(this); };
 
     struct NodeRefOverScope {
         LoaderContext* ctx;
@@ -320,6 +336,22 @@ struct LoaderContext {
         }
     };
     NodeRefOverScope OverrideNodeRef(mx::Node* nodeRef) { return NodeRefOverScope(this, nodeRef); }
+
+    template <typename F>
+    void TraverseSubNodes(Node* node, F&& cb) {
+        cb(node);
+        for (auto& entry : node->subNodes) {
+            TraverseSubNodes(entry.second.get(), cb);
+        }
+    }
+
+    template <typename F>
+    void TraverseNodes(Node* node, F&& cb) {
+        TraverseSubNodes(node, cb);
+        for (auto& globalNode : globalNodes) {
+            TraverseSubNodes(globalNode.second.get(), cb);
+        }
+    }
 };
 
 //------------------------------------------------------------------------------
@@ -342,6 +374,8 @@ struct Node {
     T* AsA() {
         return dynamic_cast<T*>(this);
     }
+
+    static Node::Ptr Create(mx::Element* element, LoaderContext* context);
 };
 
 /// The node with rpr_material_node underlying type
@@ -375,67 +409,30 @@ struct MtlxNodeGraphNode : public Node {
 };
 
 //------------------------------------------------------------------------------
-// MtlxNodeGraphNode implementation
+// Loader context implementation
 //------------------------------------------------------------------------------
 
-MtlxNodeGraphNode::MtlxNodeGraphNode(mx::NodeGraphPtr graph, LoaderContext* context)
-    : mtlxGraph(std::move(graph)) {
-
-    auto logScope = context->GetLogScope();
-    context->LogLine("- NodeGraph: %s\n", mtlxGraph->getName().c_str());
-
-    std::set<mx::Edge> processedEdges;
-    for (auto& output : mtlxGraph->getOutputs()) {
-        for (auto& edge : output->traverseGraph()) {
-            if (processedEdges.count(edge)) {
-                continue;
-            }
-            processedEdges.insert(edge);
-
-            auto upstreamElem = edge.getUpstreamElement();
-            auto downstreamElem = edge.getDownstreamElement();
-            if (!upstreamElem || !downstreamElem) continue;
-
-            auto upstreamNode = GetNode(upstreamElem.get(), context);
-            if (!upstreamNode) {
-                context->LogLine("Failed to process %s edge: upstream node does not exist\n", to_string(edge).c_str());
-                continue;
-            }
-
-            auto connectingElem = edge.getConnectingElement();
-            if (!connectingElem) {
-                continue;
-            }
-
-            auto downstreamNode = GetNode(downstreamElem.get(), context);
-            if (!downstreamNode) {
-                context->LogLine("Failed to process %s edge: downstream node does not exist\n", to_string(edge).c_str());
-                continue;
-            }
-
-            auto status = upstreamNode->Connect(nullptr, downstreamNode, connectingElem.get(), context);
-            if (status == RPR_SUCCESS) {
-                context->LogLine(" - Connection: %s\n", to_string(edge).c_str());
-
-            // TODO: should we invalidate node here?
-            } else if (status == RPR_ERROR_INVALID_PARAMETER) {
-                context->LogLine(" - Failed to connect %s edge: downstream node does not have such input\n", to_string(edge).c_str());
-            } else {
-                context->LogLine(" - Failed to connect %s edge: rpr error - %d\n", to_string(edge).c_str(), status);
-            }
+Node* LoaderContext::GetGlobalNode(mx::Element* element) {
+    auto it = globalNodes.find(element->getName());
+    if (it == globalNodes.end()) {
+        auto logScope = EnterGlobalLogScope();
+        if (auto newNode = Node::Create(element, this)) {
+            it = globalNodes.emplace(element->getName(), std::move(newNode)).first;
         }
     }
+
+    if (it == globalNodes.end()) {
+        return nullptr;
+    }
+    return it->second.get();
 }
 
-// TODO: add error handling
-Node* MtlxNodeGraphNode::GetNode(mx::Element* element, LoaderContext* context) {
-    // Return cached node if such present
-    //
-    auto it = subNodes.find(element->getName());
-    if (it != subNodes.end()) {
-        return it->second.get();
-    }
+//------------------------------------------------------------------------------
+// Node implementation
+//------------------------------------------------------------------------------
 
+// TODO: add error handling
+Node::Ptr Node::Create(mx::Element* element, LoaderContext* context) {
     // TODO: Is it possible to have here something except node/output?
     auto mtlxNode = element->asA<mx::Node>();
     if (!mtlxNode) {
@@ -614,8 +611,10 @@ Node* MtlxNodeGraphNode::GetNode(mx::Element* element, LoaderContext* context) {
                     if (!interfaceValueElement) {
                         // Otherwise, get default value from node definition
                         //
-                        if (auto nodeDef = mtlxGraph->getNodeDef()) {
-                            interfaceValueElement = nodeDef->getValueElement(interfaceName);
+                        if (auto nodeGraph = mtlxNode->getAncestorOfType<mx::NodeGraph>()) {
+                            if (auto nodeDef = nodeGraph->getNodeDef()) {
+                                interfaceValueElement = nodeDef->getValueElement(interfaceName);
+                            }
                         }
                     }
 
@@ -637,9 +636,75 @@ Node* MtlxNodeGraphNode::GetNode(mx::Element* element, LoaderContext* context) {
         }
     }
 
+    return newNode;
+}
+
+//------------------------------------------------------------------------------
+// MtlxNodeGraphNode implementation
+//------------------------------------------------------------------------------
+
+MtlxNodeGraphNode::MtlxNodeGraphNode(mx::NodeGraphPtr graph, LoaderContext* context)
+    : mtlxGraph(std::move(graph)) {
+
+    context->LogLine("- NodeGraph: %s\n", mtlxGraph->getName().c_str());
+    auto NestedLogScope = context->EnterNestedLogScope();
+
+    std::set<mx::Edge> processedEdges;
+    for (auto& output : mtlxGraph->getOutputs()) {
+        for (auto& edge : output->traverseGraph()) {
+            if (processedEdges.count(edge)) {
+                continue;
+            }
+            processedEdges.insert(edge);
+
+            auto upstreamElem = edge.getUpstreamElement();
+            auto downstreamElem = edge.getDownstreamElement();
+            if (!upstreamElem || !downstreamElem) continue;
+
+            auto upstreamNode = GetNode(upstreamElem.get(), context);
+            if (!upstreamNode) {
+                context->LogLine("Failed to process %s edge: upstream node does not exist\n", to_string(edge).c_str());
+                continue;
+            }
+
+            auto connectingElem = edge.getConnectingElement();
+            if (!connectingElem) {
+                continue;
+            }
+
+            auto downstreamNode = GetNode(downstreamElem.get(), context);
+            if (!downstreamNode) {
+                context->LogLine("Failed to process %s edge: downstream node does not exist\n", to_string(edge).c_str());
+                continue;
+            }
+
+            auto status = upstreamNode->Connect(nullptr, downstreamNode, connectingElem.get(), context);
+            if (status == RPR_SUCCESS) {
+                context->LogLine(" - Connection: %s\n", to_string(edge).c_str());
+
+            // TODO: should we invalidate node here?
+            } else if (status == RPR_ERROR_INVALID_PARAMETER) {
+                context->LogLine(" - Failed to connect %s edge: downstream node does not have such input\n", to_string(edge).c_str());
+            } else {
+                context->LogLine(" - Failed to connect %s edge: rpr error - %d\n", to_string(edge).c_str(), status);
+            }
+        }
+    }
+}
+
+Node* MtlxNodeGraphNode::GetNode(mx::Element* element, LoaderContext* context) {
+    // Return cached node if such present
+    //
+    auto it = subNodes.find(element->getName());
+    if (it != subNodes.end()) {
+        return it->second.get();
+    }
+
+    auto newNode = Node::Create(element, context);
+
     auto retPtr = newNode.get();
     if (newNode) {
-        subNodes[mtlxNode->getName()] = std::move(newNode);
+        subNodes[element->getName()] = std::move(newNode);
     }
     return retPtr;
 }
@@ -720,7 +785,7 @@ rpr_status RprNode::SetInput(mx::Element* inputElement, mx::ValueElement* value,
         return RPR_ERROR_INVALID_PARAMETER;
     }
 
-    // The value element may either specify value directly
+    // The value element may specify either value or output but not both at once
     //
     if (!value->getValueString().empty()) {
         context->LogLine("    %s\n", value->getValueString().c_str());
@@ -754,42 +819,46 @@ rpr_status RprNode::SetInput(mx::Element* inputElement, mx::ValueElement* value,
         } catch (mx::ExceptionTypeError& e) {
             context->LogLine("    Failed to parse %s value: %s\n", value->getName().c_str(), e.what());
         }
+    } else {
+        auto& outputName = value->getAttribute(mx::PortElement::OUTPUT_ATTRIBUTE);
+        if (!outputName.empty()) {
 
-    // Or reference some node from NodeGraph
-    //
-    } else if (!value->getAttribute(mx::PortElement::NODE_GRAPH_ATTRIBUTE).empty()) {
-        auto& nodeGraphName = value->getAttribute(mx::PortElement::NODE_GRAPH_ATTRIBUTE);
-
-        if (auto nodeGraph = context->mtlxDocument->getNodeGraph(nodeGraphName)) {
-            mx::OutputPtr nodeGraphOutput;
-
-            // The value element may specify the output node name but not obliged to do it
+            // The output string may point to the output of some node graph or free-standing (global) output
             //
-            auto& nodeGraphOutputName = value->getAttribute(mx::PortElement::OUTPUT_ATTRIBUTE);
-            if (!nodeGraphOutputName.empty()) {
-                nodeGraphOutput = nodeGraph->getOutput(nodeGraphOutputName);
+            auto& nodeGraphName = value->getAttribute(mx::PortElement::NODE_GRAPH_ATTRIBUTE);
+            if (!nodeGraphName.empty()) {
+                if (auto nodeGraph = context->mtlxDocument->getNodeGraph(nodeGraphName)) {
+                    if (auto nodeGraphOutput = nodeGraph->getOutput(outputName)) {
+                        auto subNode = std::make_unique<MtlxNodeGraphNode>(std::move(nodeGraph), context);
+                        auto status = subNode->Connect(nodeGraphOutput.get(), this, inputElement, context);
+                        if (status == RPR_SUCCESS) {
+                            subNodes[value->getName()] = std::move(subNode);
+                            return RPR_SUCCESS;
+                        }
+                    }
+                }
+
+            // A global output is an output that is defined globally in mtlxDocument
+            //
             } else {
-                // When the output name is missing, take the first output with the matching type
-                //
-                for (auto& output : nodeGraph->getOutputs()) {
-                    if (output->getType() == value->getType()) {
-                        nodeGraphOutput = output;
-                        break;
+                if (auto output = context->mtlxDocument->getOutput(outputName)) {
+                    // Such outputs point to a globally instantiated nodes
+                    //
+                    if (auto connectedNode = output->getConnectedNode()) {
+                        auto connectedNodeOutputName = output->getOutputString();
+                        if (auto connectedNodeDef = connectedNode->getNodeDef()) {
+                            if (auto connectedNodeOutput = connectedNodeDef->getOutput(connectedNodeOutputName)) {
+                                if (auto globalNode = context->GetGlobalNode(connectedNode.get())) {
+                                    return globalNode->Connect(connectedNodeOutput.get(), this, inputElement, context);
+                                }
+                            }
+                        }
                     }
                 }
             }
-
-            if (nodeGraphOutput) {
-                auto subNode = std::make_unique<MtlxNodeGraphNode>(std::move(nodeGraph), context);
-                auto status = subNode->Connect(nodeGraphOutput.get(), this, inputElement, context);
-                if (status == RPR_SUCCESS) {
-                    subNodes[value->getName()] = std::move(subNode);
-                    return RPR_SUCCESS;
-                }
-            }
+        } else {
+            context->LogLine("    Failed to set input: invalid value element structure - %s\n", value->asString().c_str());
         }
-    } else {
-        context->LogLine("    Failed to set input: unknown value element structure - %s\n", value->asString().c_str());
     }
 
     return RPR_ERROR_INVALID_PARAMETER;
@@ -869,7 +938,6 @@ HsMtlxLoader::Result HsMtlxLoader::Load(mx::Document* mtlxDocument, rpr_material
         ctx.shaderRef = shaderRef.get();
         MtlxNodeGraphNode graphNode(nodeGraph, &ctx);
 
-
         auto surfaceNodeIt = graphNode.subNodes.find(surfaceOutput->getNodeName());
         if (surfaceNodeIt != graphNode.subNodes.end()) {
             RprNode* rootNode = nullptr;
@@ -889,20 +957,11 @@ HsMtlxLoader::Result HsMtlxLoader::Load(mx::Document* mtlxDocument, rpr_material
 
             if (rootNode) {
 
-                std::function<void(Node*, std::function<void(Node*)> const&)> traverseSubnodes =
-                    [&traverseSubnodes](Node* node, std::function<void(Node*)> const& cb) {
-                    cb(node);
-                    for (auto& entry : node->subNodes) {
-                        traverseSubnodes(entry.second.get(), cb);
-                    }
-                };
-
                 Result ret = {};
-                ret.surfaceRootNodeIdx = std::distance(graphNode.subNodes.begin(), surfaceNodeIt);
 
                 // Calculate the total number of rpr nodes
                 //
-                traverseSubnodes(&graphNode, [&ret](Node* node) {
+                ctx.TraverseNodes(&graphNode, [&ret](Node* node) {
                     if (auto rprNode = node->AsA<RprNode>()) {
                         ret.numNodes++;
                     }
@@ -913,7 +972,7 @@ HsMtlxLoader::Result HsMtlxLoader::Load(mx::Document* mtlxDocument, rpr_material
                 // Move all rpr nodes from subnodes into the return array
                 //
                 size_t nodeIdx = 0;
-                traverseSubnodes(&graphNode, [&ret, &nodeIdx, &rootNode](Node* node) {
+                ctx.TraverseNodes(&graphNode, [&ret, &nodeIdx, &rootNode](Node* node) {
                     if (auto rprNode = node->AsA<RprNode>()) {
                         if (rprNode->rprNode == rootNode->rprNode) {
                             ret.surfaceRootNodeIdx = nodeIdx;

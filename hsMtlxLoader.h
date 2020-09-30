@@ -12,7 +12,7 @@ public:
 
     struct Result {
         /// All rpr nodes that form a material graph
-        rpr_material_node* nodes;
+        rpr_material_node* nodes = nullptr;
 
         /// Number of elements in nodes array
         size_t numNodes;
@@ -29,7 +29,7 @@ public:
             rpr_material_node rprNode;
         };
 
-        ImageNode* imageNodes;
+        ImageNode* imageNodes = nullptr;
         size_t numImageNodes;
     };
 
