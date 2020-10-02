@@ -10,6 +10,12 @@ public:
     void SetupStdlib(MaterialX::FilePathVec const& libraryNames, MaterialX::FileSearchPath const& searchPath);
     void SetLogging(bool enable) { _loggingEnabled = enable; }
 
+    enum OutputType {
+        Surface,
+        Displacement,
+        kMaxNumOutputs
+    };
+
     struct Result {
         /// All rpr nodes that form a material graph
         rpr_material_node* nodes = nullptr;
@@ -17,8 +23,8 @@ public:
         /// Number of elements in nodes array
         size_t numNodes;
 
-        /// Index of the root node of the surface graph
-        size_t surfaceRootNodeIdx;
+        size_t rootNodeIndices[kMaxNumOutputs];
+        static const size_t kInvalidRootNodeIndex = size_t(-1);
 
         struct ImageNode {
             /// Path to the image file
